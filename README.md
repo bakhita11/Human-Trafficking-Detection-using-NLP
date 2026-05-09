@@ -70,19 +70,7 @@ python evaluate.py
 Ethical Notice
 This project is intended strictly for research and decision-support purposes.
 The system should not be used as an autonomous enforcement tool. Human review and oversight are required for all operational use cases.
-License
-MIT License
+ 
 
-Then on GitHub:
-
-1. Click:
-
-```text id="t9d2ks"
-Add file → Create new file
-2.	Name the file:
-README.md
-3.	Paste the content.
-4.	Click:
-Commit changes
-Your repository will instantly look much more professional.
+ 
 
