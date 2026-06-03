@@ -70,7 +70,10 @@ python evaluate.py
 Ethical Notice
 This project is intended strictly for research and decision-support purposes.
 The system should not be used as an autonomous enforcement tool. Human review and oversight are required for all operational use cases.
- 
+
+Part 7b
+
+To assess robustness to evolving trafficking language, a linguistic variation experiment was conducted in which progressively stronger perturbations were applied to the held-out test advertisements. Four variation levels (Low, Moderate, High, and Severe) introduced increasing degrees of lexical substitution, spelling variation, and token removal intended to approximate euphemistic drift and indirect phrasing commonly observed in real-world trafficking advertisements. Macro F1-score was computed at each variation level to evaluate performance degradation under increasing distribution shift.
 
  
 
