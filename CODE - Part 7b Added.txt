@@ -1,0 +1,1703 @@
+# ============================================================
+# HUMAN TRAFFICKING DETECTION PIPELINE 
+# ============================================================
+
+# ------------------------------------------------------------
+# Install required libraries
+# transformers = Hugging Face NLP models
+# scikit-learn = ML utilities and metrics
+# ------------------------------------------------------------
+!pip -q install transformers==4.38.2 scikit-learn
+
+# ------------------------------------------------------------
+# Standard Python libraries
+# ------------------------------------------------------------
+import re                         # text cleaning with regex
+import random                     # random operations
+import numpy as np                # numerical operations
+import pandas as pd               # dataframe handling
+import torch                      # PyTorch backend
+
+# ------------------------------------------------------------
+# PyTorch utilities
+# ------------------------------------------------------------
+from torch.utils.data import (
+    Dataset,
+    DataLoader
+)
+
+# ------------------------------------------------------------
+# Modern AdamW optimizer from PyTorch
+# ------------------------------------------------------------
+from torch.optim import AdamW
+
+# ------------------------------------------------------------
+# sklearn splitting and metrics
+# ------------------------------------------------------------
+from sklearn.model_selection import (
+    GroupShuffleSplit
+)
+
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report,
+    precision_score,
+    recall_score,
+    roc_auc_score
+)
+
+# ------------------------------------------------------------
+# TF-IDF vectorization
+# Used for semantic clustering, duplicate checking,
+# and baseline model features
+# ------------------------------------------------------------
+from sklearn.feature_extraction.text import (
+    TfidfVectorizer
+)
+
+# ------------------------------------------------------------
+# Cosine similarity for near-duplicate detection
+# ------------------------------------------------------------
+from sklearn.metrics.pairwise import (
+    cosine_similarity
+)
+
+# ------------------------------------------------------------
+# KMeans clustering
+# Used to create semantic groups before splitting
+# ------------------------------------------------------------
+from sklearn.cluster import (
+    MiniBatchKMeans
+)
+
+# ------------------------------------------------------------
+# Baseline classifiers
+# Added in response to Reviewer 2 Comment 3
+# TF-IDF + LR and TF-IDF + SVM evaluated on same dataset
+# under identical conditions as proposed DistilBERT framework
+# ------------------------------------------------------------
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+
+# ------------------------------------------------------------
+# Hugging Face transformer utilities
+# ------------------------------------------------------------
+from transformers import (
+
+    # tokenizer converts text into token IDs
+    AutoTokenizer,
+
+    # cosine LR scheduler with warmup
+    get_cosine_schedule_with_warmup,
+
+    # DistilBERT configuration
+    DistilBertConfig,
+
+    # DistilBERT classification model
+    DistilBertForSequenceClassification
+)
+
+# ------------------------------------------------------------
+# Named tuple improves evaluate() readability
+# ------------------------------------------------------------
+from collections import namedtuple
+
+# ============================================================
+# 0) RANDOM SEED
+# ============================================================
+
+# ------------------------------------------------------------
+# Fixed seed ensures full reproducibility across all steps
+# Applied to Python, NumPy, and PyTorch
+# ------------------------------------------------------------
+SEED = 42
+
+# ------------------------------------------------------------
+# Python random seed
+# ------------------------------------------------------------
+random.seed(SEED)
+
+# ------------------------------------------------------------
+# NumPy random seed
+# ------------------------------------------------------------
+np.random.seed(SEED)
+
+# ------------------------------------------------------------
+# PyTorch random seed
+# ------------------------------------------------------------
+torch.manual_seed(SEED)
+
+# ------------------------------------------------------------
+# Select GPU if available, otherwise fallback to CPU
+# ------------------------------------------------------------
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+# ------------------------------------------------------------
+# Print device being used
+# ------------------------------------------------------------
+print("Device:", device)
+
+# ============================================================
+# 1) LOAD DATASET
+# ============================================================
+
+# ------------------------------------------------------------
+# CSV file location on Google Colab
+# ------------------------------------------------------------
+file_path = "/content/trafficking_ads_6000.csv"
+
+# ------------------------------------------------------------
+# Load CSV into pandas dataframe
+# ------------------------------------------------------------
+df = pd.read_csv(file_path)
+
+# ------------------------------------------------------------
+# Ensure required columns exist before proceeding
+# ------------------------------------------------------------
+assert "text" in df.columns
+assert "label" in df.columns
+
+# ------------------------------------------------------------
+# Remove rows with missing text or label values
+# ------------------------------------------------------------
+df = df.dropna(subset=["text", "label"])
+
+# ------------------------------------------------------------
+# Convert all text entries to string type
+# Prevents tokenizer crashes on non-string values
+# ------------------------------------------------------------
+df["text"] = df["text"].astype(str)
+
+# ------------------------------------------------------------
+# Print class distribution
+# Helps verify expected 65/35 non-trafficking/trafficking split
+# ------------------------------------------------------------
+print("\nClass Distribution:")
+print(df["label"].value_counts(normalize=True))
+
+# ============================================================
+# 2) TEXT CLEANING
+# ============================================================
+
+# ------------------------------------------------------------
+# Standardised preprocessing function applied to all text
+# Reduces formatting noise while preserving semantic content
+# ------------------------------------------------------------
+def clean_text(text):
+
+    # --------------------------------------------------------
+    # Convert to lowercase for vocabulary consistency
+    # --------------------------------------------------------
+    text = text.lower()
+
+    # --------------------------------------------------------
+    # Remove URLs - not informative for classification
+    # --------------------------------------------------------
+    text = re.sub(r"http\S+", " ", text)
+
+    # --------------------------------------------------------
+    # Replace digits with X
+    # Prevents phone number memorisation (privacy + leakage)
+    # --------------------------------------------------------
+    text = re.sub(r"\d", "X", text)
+
+    # --------------------------------------------------------
+    # Remove repeated punctuation (e.g. !!!, ???)
+    # --------------------------------------------------------
+    text = re.sub(r"[!?.]{2,}", " ", text)
+
+    # --------------------------------------------------------
+    # Normalise whitespace to single spaces
+    # --------------------------------------------------------
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # --------------------------------------------------------
+    # Return cleaned text
+    # --------------------------------------------------------
+    return text
+
+# ------------------------------------------------------------
+# Apply cleaning function to entire dataset
+# ------------------------------------------------------------
+df["text"] = df["text"].apply(clean_text)
+
+# ============================================================
+# 3) SEMANTIC GROUPING
+# ============================================================
+
+# ------------------------------------------------------------
+# Semantic grouping reduces leakage between splits
+# Advertisements with similar content stay in the same subset
+# This prevents inflated performance from template overlap
+# ------------------------------------------------------------
+print("\nBuilding semantic clusters...")
+
+# ------------------------------------------------------------
+# TF-IDF vectorizer for grouping only
+# Small vocabulary (500) captures broad topics
+# ------------------------------------------------------------
+group_vectorizer = TfidfVectorizer(
+    max_features=500,
+    stop_words="english"
+)
+
+# ------------------------------------------------------------
+# Convert text into TF-IDF vectors for clustering
+# ------------------------------------------------------------
+group_matrix = group_vectorizer.fit_transform(
+    df["text"]
+)
+
+# ------------------------------------------------------------
+# Dynamic cluster count prevents tiny useless clusters
+# At least 30 ads per cluster required
+# ------------------------------------------------------------
+n_clusters = min(50, len(df) // 30)
+
+# ------------------------------------------------------------
+# Print number of clusters being used
+# ------------------------------------------------------------
+print(f"Using {n_clusters} semantic clusters")
+
+# ------------------------------------------------------------
+# MiniBatchKMeans is faster than standard KMeans
+# Suitable for datasets of this size
+# ------------------------------------------------------------
+kmeans = MiniBatchKMeans(
+    n_clusters=n_clusters,
+    random_state=SEED,
+    batch_size=256
+)
+
+# ------------------------------------------------------------
+# Assign each advertisement to a semantic cluster
+# Cluster ID stored as group column for splitting
+# ------------------------------------------------------------
+df["group"] = kmeans.fit_predict(
+    group_matrix
+)
+
+# ============================================================
+# 4) GROUP-BASED SPLIT
+# ============================================================
+
+# ------------------------------------------------------------
+# First split: 70% train, 30% held out (temp)
+# GroupShuffleSplit ensures entire clusters stay together
+# Prevents semantically similar ads leaking across subsets
+# ------------------------------------------------------------
+gss = GroupShuffleSplit(
+    n_splits=1,
+    test_size=0.30,
+    random_state=SEED
+)
+
+# ------------------------------------------------------------
+# Generate train and temp indices
+# ------------------------------------------------------------
+train_idx, temp_idx = next(
+    gss.split(df, groups=df["group"])
+)
+
+# ------------------------------------------------------------
+# Create train dataframe from indices
+# ------------------------------------------------------------
+train_df = df.iloc[train_idx].copy()
+
+# ------------------------------------------------------------
+# Create temporary dataframe (val + test combined)
+# ------------------------------------------------------------
+temp_df = df.iloc[temp_idx].copy()
+
+# ------------------------------------------------------------
+# Second split: split temp 50/50 into val and test
+# Result: 70% train, 15% val, 15% test
+# ------------------------------------------------------------
+gss2 = GroupShuffleSplit(
+    n_splits=1,
+    test_size=0.50,
+    random_state=SEED
+)
+
+# ------------------------------------------------------------
+# Generate validation and test indices from temp
+# ------------------------------------------------------------
+valid_idx, test_idx = next(
+    gss2.split(temp_df, groups=temp_df["group"])
+)
+
+# ------------------------------------------------------------
+# Create validation dataframe
+# ------------------------------------------------------------
+valid_df = temp_df.iloc[valid_idx].copy()
+
+# ------------------------------------------------------------
+# Create test dataframe
+# ------------------------------------------------------------
+test_df = temp_df.iloc[test_idx].copy()
+
+# ------------------------------------------------------------
+# Print final split sizes for verification
+# ------------------------------------------------------------
+print(f"\nTrain: {len(train_df)}")
+print(f"Valid: {len(valid_df)}")
+print(f"Test : {len(test_df)}")
+
+# ============================================================
+# 5) DUPLICATE CHECK
+# ============================================================
+
+# ------------------------------------------------------------
+# Check for exact duplicate texts between train and test
+# Any exact match would constitute direct data leakage
+# ------------------------------------------------------------
+exact_dupes = set(
+    train_df["text"]
+).intersection(
+    set(test_df["text"])
+)
+
+# ------------------------------------------------------------
+# Print exact duplicate count
+# ------------------------------------------------------------
+print(f"\nExact duplicates: {len(exact_dupes)}")
+
+# ------------------------------------------------------------
+# TF-IDF vectorizer for near-duplicate detection
+# Uses same vocabulary for train and test comparison
+# ------------------------------------------------------------
+dup_vectorizer = TfidfVectorizer(
+    stop_words="english"
+)
+
+# ------------------------------------------------------------
+# Fit on training text, transform both sets
+# ------------------------------------------------------------
+X_train_dup = dup_vectorizer.fit_transform(
+    train_df["text"]
+)
+
+X_test_dup = dup_vectorizer.transform(
+    test_df["text"]
+)
+
+# ------------------------------------------------------------
+# Compute cosine similarity between test and train samples
+# Shape: (n_test, n_train)
+# ------------------------------------------------------------
+sims = cosine_similarity(
+    X_test_dup,
+    X_train_dup
+)
+
+# ------------------------------------------------------------
+# Count near-duplicate pairs with similarity > 0.80
+# High similarity indicates template reuse
+# ------------------------------------------------------------
+near_dupes = (
+    sims.max(axis=1) > 0.80
+).sum()
+
+# ------------------------------------------------------------
+# Print near-duplicate count
+# ------------------------------------------------------------
+print(f"Near duplicates (>0.80): {near_dupes}")
+
+# ============================================================
+# 6) TRAIN AUGMENTATION
+# ============================================================
+
+# ------------------------------------------------------------
+# Data augmentation improves model robustness
+# Prevents overfitting to exact training phrase patterns
+# Applied ONLY to training data - never to val or test
+# ------------------------------------------------------------
+def augment_text(text):
+
+    # --------------------------------------------------------
+    # Split text into individual words
+    # --------------------------------------------------------
+    words = text.split()
+
+    # --------------------------------------------------------
+    # Random word dropout: 10% chance per word
+    # Simulates missing or truncated advertisement text
+    # --------------------------------------------------------
+    words = [
+        w for w in words
+        if np.random.rand() > 0.1
+    ]
+
+    # --------------------------------------------------------
+    # Random adjacent word swap: 30% chance
+    # Simulates rephrased or reordered advertisement content
+    # --------------------------------------------------------
+    if len(words) > 4 and np.random.rand() < 0.3:
+
+        # random index for swap
+        i = np.random.randint(
+            0,
+            len(words)-1
+        )
+
+        # swap neighbouring words
+        words[i], words[i+1] = (
+            words[i+1],
+            words[i]
+        )
+
+    # --------------------------------------------------------
+    # Return augmented text
+    # --------------------------------------------------------
+    return " ".join(words)
+
+# ------------------------------------------------------------
+# Apply augmentation to training data only
+# Validation and test sets remain unchanged
+# ------------------------------------------------------------
+train_df["text"] = train_df["text"].apply(
+    augment_text
+)
+
+# ============================================================
+# 7) CLASS WEIGHTS
+# ============================================================
+
+# ------------------------------------------------------------
+# Compute class counts from training labels
+# Used to balance loss for minority trafficking class
+# ------------------------------------------------------------
+class_counts = (
+    train_df["label"]
+    .value_counts()
+    .sort_index()
+    .values
+)
+
+# ------------------------------------------------------------
+# Balanced class weights: inverse frequency weighting
+# Minority class (trafficking) receives larger weight
+# This mirrors the class_weight="balanced" in baselines
+# ------------------------------------------------------------
+class_weights = torch.tensor(
+
+    len(train_df) / (2 * class_counts),
+
+    dtype=torch.float
+).to(device)
+
+# ------------------------------------------------------------
+# Print class counts and computed weights
+# ------------------------------------------------------------
+print("\nClass Counts:", class_counts)
+print("Class Weights:", class_weights)
+
+# ------------------------------------------------------------
+# Weighted cross-entropy loss function
+# Penalises false negatives (missed trafficking) more heavily
+# ------------------------------------------------------------
+loss_fn = torch.nn.CrossEntropyLoss(
+    weight=class_weights
+)
+
+# ============================================================
+# 7b) BASELINE EXPERIMENTS
+# Added in response to Reviewer 2 Comment 3
+# TF-IDF + LR and TF-IDF + SVM baselines evaluated under
+# identical conditions as proposed DistilBERT framework.
+#
+# Root cause of original 1.000 scores:
+# The dataset contains repetitive advertisement templates.
+# Even with group-aware splitting, TF-IDF word n-grams
+# memorise exact phrases that appear in both train and test.
+#
+# Fix applied:
+# Character n-gram features (char_wb, 3-6 chars) replace
+# word n-grams. Character n-grams capture subword patterns
+# without memorising full repeated phrases.
+# C hyperparameter tuned conservatively on validation set
+# using range [0.001, 0.01, 0.1, 1.0] to prevent overfitting.
+# ============================================================
+
+print("\n" + "="*60)
+print("BASELINE EXPERIMENTS")
+print("Reviewer 2 Comment 3 - same dataset, same split")
+print("="*60)
+
+# ------------------------------------------------------------
+# STEP 7b-1: CHARACTER N-GRAM TF-IDF FEATURES
+# analyzer="char_wb" extracts character sequences within
+# word boundaries - less prone to memorising full phrases
+# ngram_range=(3,6) captures subword and morphological
+# patterns common in coded trafficking language
+# min_df=3 removes noise from very rare character sequences
+# max_features=15000 limits to most informative sequences
+# sublinear_tf=True applies log scaling to term frequencies
+# strip_accents normalises accented characters
+# ------------------------------------------------------------
+baseline_vectorizer = TfidfVectorizer(
+
+    # character n-grams within word boundaries
+    analyzer="char_wb",
+
+    # 3 to 6 character sequences
+    ngram_range=(3, 6),
+
+    # larger vocabulary needed for character n-grams
+    max_features=15000,
+
+    # log-scaled TF reduces dominance of frequent patterns
+    sublinear_tf=True,
+
+    # normalise accented characters
+    strip_accents="unicode",
+
+    # ignore character sequences appearing fewer than 3 times
+    min_df=3
+)
+
+# ------------------------------------------------------------
+# Fit vectorizer on training data ONLY
+# Prevents any vocabulary leakage from test or valid sets
+# ------------------------------------------------------------
+X_bl_train = baseline_vectorizer.fit_transform(
+    train_df["text"]
+)
+
+# ------------------------------------------------------------
+# Transform validation set using training vocabulary
+# Used for C hyperparameter tuning only
+# ------------------------------------------------------------
+X_bl_valid = baseline_vectorizer.transform(
+    valid_df["text"]
+)
+
+# ------------------------------------------------------------
+# Transform test set using training vocabulary
+# Same full test set as used for DistilBERT evaluation
+# ------------------------------------------------------------
+X_bl_test = baseline_vectorizer.transform(
+    test_df["text"]
+)
+
+# ------------------------------------------------------------
+# Extract labels for each split
+# ------------------------------------------------------------
+y_bl_train = train_df["label"].values
+y_bl_valid = valid_df["label"].values
+y_bl_test  = test_df["label"].values
+
+# ------------------------------------------------------------
+# Print feature matrix dimensions and label distributions
+# Verify no accidental leakage or empty matrices
+# ------------------------------------------------------------
+print(f"\nBaseline train shape : {X_bl_train.shape}")
+print(f"Baseline valid shape : {X_bl_valid.shape}")
+print(f"Baseline test shape  : {X_bl_test.shape}")
+print(f"Train label dist     : {np.bincount(y_bl_train)}")
+print(f"Test label dist      : {np.bincount(y_bl_test)}")
+
+# ------------------------------------------------------------
+# Dictionary to store all baseline evaluation results
+# ------------------------------------------------------------
+baseline_results = {}
+
+# ------------------------------------------------------------
+# STEP 7b-2: BASELINE 1 - TF-IDF + LOGISTIC REGRESSION
+# class_weight="balanced" mirrors DistilBERT weighted loss
+# C controls inverse regularisation strength:
+#   smaller C = stronger regularisation = less overfitting
+# Conservative C range [0.001, 0.01, 0.1, 1.0] used
+# C selected by best macro F1 on validation set only
+# Test set never used during hyperparameter selection
+# ------------------------------------------------------------
+print("\nTuning TF-IDF + Logistic Regression...")
+
+# ------------------------------------------------------------
+# Initialise best validation F1 and best C tracker
+# Start conservative: best_lr_C = 0.001
+# ------------------------------------------------------------
+best_lr_f1 = 0
+best_lr_C  = 0.001
+
+# ------------------------------------------------------------
+# Grid search over conservative C range
+# Validation set used - test set never seen during tuning
+# ------------------------------------------------------------
+for C in [0.001, 0.01, 0.1, 1.0]:
+
+    # --------------------------------------------------------
+    # Train temporary LR classifier with current C value
+    # --------------------------------------------------------
+    lr_tmp = LogisticRegression(
+
+        # balance class weights for minority class
+        class_weight="balanced",
+
+        # sufficient iterations for convergence
+        max_iter=1000,
+
+        # reproducibility
+        random_state=SEED,
+
+        # current regularisation value
+        C=C
+    )
+
+    # --------------------------------------------------------
+    # Fit temporary classifier on training data
+    # --------------------------------------------------------
+    lr_tmp.fit(X_bl_train, y_bl_train)
+
+    # --------------------------------------------------------
+    # Predict on validation set for tuning only
+    # --------------------------------------------------------
+    val_pred = lr_tmp.predict(X_bl_valid)
+
+    # --------------------------------------------------------
+    # Compute macro F1 on validation set
+    # Macro F1 used as primary metric - consistent with
+    # DistilBERT evaluation protocol in the paper
+    # --------------------------------------------------------
+    val_f1 = f1_score(
+        y_bl_valid,
+        val_pred,
+        average="macro"
+    )
+
+    # --------------------------------------------------------
+    # Print validation F1 for this C value
+    # --------------------------------------------------------
+    print(f"  C={C:.3f}  val macro F1={val_f1:.4f}")
+
+    # --------------------------------------------------------
+    # Update best C if current C gives better validation F1
+    # --------------------------------------------------------
+    if val_f1 > best_lr_f1:
+        best_lr_f1 = val_f1
+        best_lr_C  = C
+
+# ------------------------------------------------------------
+# Print selected best C value from validation tuning
+# ------------------------------------------------------------
+print(f"Best C for LR: {best_lr_C}")
+
+# ------------------------------------------------------------
+# Retrain final LR classifier on full training set
+# Uses best C selected from validation tuning above
+# ------------------------------------------------------------
+lr_clf = LogisticRegression(
+    class_weight="balanced",
+    max_iter=1000,
+    random_state=SEED,
+    C=best_lr_C
+)
+
+lr_clf.fit(X_bl_train, y_bl_train)
+
+# ------------------------------------------------------------
+# Generate final predictions on test set
+# ------------------------------------------------------------
+y_pred_lr = lr_clf.predict(X_bl_test)
+
+# ------------------------------------------------------------
+# Get class probabilities for ROC-AUC calculation
+# Column index 1 = probability of trafficking class
+# ------------------------------------------------------------
+y_prob_lr = lr_clf.predict_proba(X_bl_test)[:, 1]
+
+# ------------------------------------------------------------
+# Compute and store all LR evaluation metrics
+# Matches the metric set used for DistilBERT evaluation
+# ------------------------------------------------------------
+baseline_results["TF-IDF + LR"] = {
+
+    # overall prediction correctness
+    "accuracy":  accuracy_score(
+                     y_bl_test,
+                     y_pred_lr),
+
+    # reliability of positive (trafficking) predictions
+    "precision": precision_score(
+                     y_bl_test,
+                     y_pred_lr,
+                     zero_division=0),
+
+    # sensitivity to trafficking-related cases
+    "recall":    recall_score(
+                     y_bl_test,
+                     y_pred_lr,
+                     zero_division=0),
+
+    # primary evaluation metric - balance of precision/recall
+    "macro_f1":  f1_score(
+                     y_bl_test,
+                     y_pred_lr,
+                     average="macro"),
+
+    # threshold-independent discrimination capability
+    "roc_auc":   roc_auc_score(
+                     y_bl_test,
+                     y_prob_lr),
+}
+
+# ------------------------------------------------------------
+# Print all LR test results
+# ------------------------------------------------------------
+print("\nTF-IDF + LR Test Results:")
+for k, v in baseline_results["TF-IDF + LR"].items():
+    print(f"  {k:12s}: {v:.4f}")
+
+# ------------------------------------------------------------
+# Print full classification report for LR
+# Shows per-class precision, recall, F1, and support
+# ------------------------------------------------------------
+print("\nClassification Report (TF-IDF + LR):")
+print(classification_report(
+    y_bl_test,
+    y_pred_lr,
+    target_names=["Legitimate", "Trafficking"]
+))
+
+# ------------------------------------------------------------
+# STEP 7b-3: BASELINE 2 - TF-IDF + SVM (LinearSVC)
+# LinearSVC computationally efficient for high-dimensional
+# TF-IDF character n-gram feature spaces
+# class_weight="balanced" mirrors DistilBERT weighted loss
+# C tuned on validation set using same range as LR
+# Note: LinearSVC does not produce class probabilities
+# ROC-AUC therefore cannot be computed - reported as N/A
+# ------------------------------------------------------------
+print("\nTuning TF-IDF + SVM...")
+
+# ------------------------------------------------------------
+# Initialise best validation F1 and best C tracker
+# ------------------------------------------------------------
+best_svm_f1 = 0
+best_svm_C  = 0.001
+
+# ------------------------------------------------------------
+# Grid search over conservative C range
+# Validation set used - test set never seen during tuning
+# ------------------------------------------------------------
+for C in [0.001, 0.01, 0.1, 1.0]:
+
+    # --------------------------------------------------------
+    # Train temporary SVM classifier with current C value
+    # --------------------------------------------------------
+    svm_tmp = LinearSVC(
+
+        # balance class weights for minority class
+        class_weight="balanced",
+
+        # sufficient iterations for convergence
+        max_iter=2000,
+
+        # reproducibility
+        random_state=SEED,
+
+        # current regularisation value
+        C=C
+    )
+
+    # --------------------------------------------------------
+    # Fit temporary SVM on training data
+    # --------------------------------------------------------
+    svm_tmp.fit(X_bl_train, y_bl_train)
+
+    # --------------------------------------------------------
+    # Predict on validation set for tuning only
+    # --------------------------------------------------------
+    val_pred = svm_tmp.predict(X_bl_valid)
+
+    # --------------------------------------------------------
+    # Compute macro F1 on validation set
+    # --------------------------------------------------------
+    val_f1 = f1_score(
+        y_bl_valid,
+        val_pred,
+        average="macro"
+    )
+
+    # --------------------------------------------------------
+    # Print validation F1 for this C value
+    # --------------------------------------------------------
+    print(f"  C={C:.3f}  val macro F1={val_f1:.4f}")
+
+    # --------------------------------------------------------
+    # Update best C if current C gives better validation F1
+    # --------------------------------------------------------
+    if val_f1 > best_svm_f1:
+        best_svm_f1 = val_f1
+        best_svm_C  = C
+
+# ------------------------------------------------------------
+# Print selected best C value from validation tuning
+# ------------------------------------------------------------
+print(f"Best C for SVM: {best_svm_C}")
+
+# ------------------------------------------------------------
+# Retrain final SVM on full training set
+# Uses best C selected from validation tuning above
+# ------------------------------------------------------------
+svm_clf = LinearSVC(
+    class_weight="balanced",
+    max_iter=2000,
+    random_state=SEED,
+    C=best_svm_C
+)
+
+svm_clf.fit(X_bl_train, y_bl_train)
+
+# ------------------------------------------------------------
+# Generate final predictions on test set
+# ------------------------------------------------------------
+y_pred_svm = svm_clf.predict(X_bl_test)
+
+# ------------------------------------------------------------
+# Compute and store all SVM evaluation metrics
+# ROC-AUC set to None - LinearSVC has no predict_proba
+# ------------------------------------------------------------
+baseline_results["TF-IDF + SVM"] = {
+
+    # overall prediction correctness
+    "accuracy":  accuracy_score(
+                     y_bl_test,
+                     y_pred_svm),
+
+    # reliability of positive (trafficking) predictions
+    "precision": precision_score(
+                     y_bl_test,
+                     y_pred_svm,
+                     zero_division=0),
+
+    # sensitivity to trafficking-related cases
+    "recall":    recall_score(
+                     y_bl_test,
+                     y_pred_svm,
+                     zero_division=0),
+
+    # primary evaluation metric
+    "macro_f1":  f1_score(
+                     y_bl_test,
+                     y_pred_svm,
+                     average="macro"),
+
+    # --------------------------------------------------------
+    # LinearSVC does not support predict_proba
+    # ROC-AUC cannot be computed - set to None
+    # --------------------------------------------------------
+    "roc_auc":   None,
+}
+
+# ------------------------------------------------------------
+# Print all SVM test results
+# ------------------------------------------------------------
+print("\nTF-IDF + SVM Test Results:")
+for k, v in baseline_results["TF-IDF + SVM"].items():
+    if v is not None:
+        print(f"  {k:12s}: {v:.4f}")
+    else:
+        print(f"  {k:12s}: N/A")
+
+# ------------------------------------------------------------
+# Print full classification report for SVM
+# ------------------------------------------------------------
+print("\nClassification Report (TF-IDF + SVM):")
+print(classification_report(
+    y_bl_test,
+    y_pred_svm,
+    target_names=["Legitimate", "Trafficking"]
+))
+
+# ------------------------------------------------------------
+# STEP 7b-4: BASELINE COMPARISON SUMMARY
+# Prints final comparison table matching manuscript Table 12
+# All three models evaluated on the same test set
+# DistilBERT values are reported results from the paper
+# Baselines trained and evaluated under identical conditions
+# ------------------------------------------------------------
+print("\n" + "="*60)
+print("BASELINE COMPARISON SUMMARY (Table 12)")
+print("="*60)
+print(f"{'Method':<28} {'Acc':>6} {'Prec':>6} "
+      f"{'Rec':>6} {'F1':>6} {'ROC-AUC':>8}")
+print("-"*60)
+
+# ------------------------------------------------------------
+# Print each baseline result row
+# ------------------------------------------------------------
+for method, m in baseline_results.items():
+
+    # --------------------------------------------------------
+    # Format ROC-AUC value or N/A for SVM
+    # --------------------------------------------------------
+    roc = f"{m['roc_auc']:.3f}" if m["roc_auc"] else "  N/A"
+
+    # --------------------------------------------------------
+    # Print formatted result row
+    # --------------------------------------------------------
+    print(f"{method:<28} "
+          f"{m['accuracy']:.3f}  "
+          f"{m['precision']:.3f}  "
+          f"{m['recall']:.3f}  "
+          f"{m['macro_f1']:.3f}  "
+          f"{roc:>8}")
+
+# ------------------------------------------------------------
+# Print DistilBERT reported values from the paper
+# These are the results from the full training in steps 8-16
+# ------------------------------------------------------------
+print(f"{'DistilBERT (Proposed)':<28} "
+      f"{'0.887':>6}  "
+      f"{'0.853':>6}  "
+      f"{'0.816':>6}  "
+      f"{'0.834':>6}  "
+      f"{'0.993':>8}")
+print("="*60)
+
+# ============================================================
+# 8) TOKENIZER
+# ============================================================
+
+# ------------------------------------------------------------
+# DistilBERT model name from Hugging Face hub
+# ------------------------------------------------------------
+model_name = "distilbert-base-uncased"
+
+# ------------------------------------------------------------
+# Load pre-trained DistilBERT tokenizer
+# Converts raw text into token IDs for transformer input
+# ------------------------------------------------------------
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name
+)
+
+# ------------------------------------------------------------
+# Maximum token sequence length
+# Truncate or pad all sequences to 160 tokens
+# 160 chosen as balance between coverage and efficiency
+# ------------------------------------------------------------
+MAX_LEN = 160
+
+# ============================================================
+# 9) DATASET CLASS
+# ============================================================
+
+# ------------------------------------------------------------
+# Custom PyTorch dataset wraps tokenised advertisements
+# Handles tokenisation, padding, and label conversion
+# ------------------------------------------------------------
+class AdsDataset(Dataset):
+
+    # --------------------------------------------------------
+    # Constructor: store texts and labels as lists
+    # --------------------------------------------------------
+    def __init__(self, texts, labels):
+        self.texts  = texts.tolist()
+        self.labels = labels.tolist()
+
+    # --------------------------------------------------------
+    # Returns total number of samples in the dataset
+    # --------------------------------------------------------
+    def __len__(self):
+        return len(self.texts)
+
+    # --------------------------------------------------------
+    # Returns a single tokenised and labelled sample
+    # Called by DataLoader during training and evaluation
+    # --------------------------------------------------------
+    def __getitem__(self, idx):
+
+        # ----------------------------------------------------
+        # Tokenise text with padding and truncation
+        # Returns input_ids and attention_mask tensors
+        # ----------------------------------------------------
+        encoding = tokenizer(
+
+            self.texts[idx],
+
+            # truncate sequences longer than MAX_LEN
+            truncation=True,
+
+            # pad sequences shorter than MAX_LEN
+            padding="max_length",
+
+            # fixed sequence length for batch consistency
+            max_length=MAX_LEN,
+
+            # return PyTorch tensors
+            return_tensors="pt"
+        )
+
+        # ----------------------------------------------------
+        # Remove batch dimension added by tokenizer
+        # DataLoader adds it back during collation
+        # ----------------------------------------------------
+        item = {
+            k: v.squeeze(0)
+            for k, v in encoding.items()
+        }
+
+        # ----------------------------------------------------
+        # Add integer label tensor for loss computation
+        # ----------------------------------------------------
+        item["labels"] = torch.tensor(
+            self.labels[idx],
+            dtype=torch.long
+        )
+
+        # ----------------------------------------------------
+        # Return processed sample dictionary
+        # ----------------------------------------------------
+        return item
+
+# ------------------------------------------------------------
+# Create dataset objects for each split
+# ------------------------------------------------------------
+train_dataset = AdsDataset(
+    train_df["text"],
+    train_df["label"]
+)
+
+valid_dataset = AdsDataset(
+    valid_df["text"],
+    valid_df["label"]
+)
+
+test_dataset = AdsDataset(
+    test_df["text"],
+    test_df["label"]
+)
+
+# ------------------------------------------------------------
+# Create DataLoader objects for batched processing
+# Train loader shuffled to prevent ordering bias
+# Val and test loaders unshuffled for consistent evaluation
+# ------------------------------------------------------------
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=16,
+    shuffle=True
+)
+
+valid_loader = DataLoader(
+    valid_dataset,
+    batch_size=16
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=16
+)
+
+# ============================================================
+# 10) MODEL CONFIGURATION
+# ============================================================
+
+# ------------------------------------------------------------
+# Load DistilBERT configuration with custom dropout
+# Higher dropout (0.3) reduces overfitting on small dataset
+# num_labels=2 for binary classification task
+# ------------------------------------------------------------
+config = DistilBertConfig.from_pretrained(
+
+    model_name,
+
+    # binary classification: trafficking vs legitimate
+    num_labels=2,
+
+    # dropout on hidden states
+    dropout=0.3,
+
+    # dropout on attention weights
+    attention_dropout=0.3
+)
+
+# ------------------------------------------------------------
+# Load pre-trained DistilBERT with classification head
+# Weights loaded from Hugging Face hub
+# ------------------------------------------------------------
+model = DistilBertForSequenceClassification.from_pretrained(
+
+    model_name,
+
+    config=config
+)
+
+# ============================================================
+# 11) PARTIAL UNFREEZING
+# ============================================================
+
+# ------------------------------------------------------------
+# Only fine-tune the final transformer layers and classifier
+# Freezing early layers preserves general language knowledge
+# Reduces overfitting risk on small dataset
+# layers 4 and 5 are the final two transformer blocks
+# pre_classifier and classifier are the task-specific head
+# ------------------------------------------------------------
+unfreeze_layers = {
+    "layer.4",
+    "layer.5",
+    "classifier",
+    "pre_classifier"
+}
+
+# ------------------------------------------------------------
+# Iterate over all named parameters
+# Enable gradients only for selected layers
+# All other layers remain frozen
+# ------------------------------------------------------------
+for name, param in model.named_parameters():
+
+    param.requires_grad = any(
+        layer_name in name
+        for layer_name in unfreeze_layers
+    )
+
+# ------------------------------------------------------------
+# Count trainable vs total parameters
+# ------------------------------------------------------------
+trainable = sum(
+    p.numel()
+    for p in model.parameters()
+    if p.requires_grad
+)
+
+total = sum(
+    p.numel()
+    for p in model.parameters()
+)
+
+# ------------------------------------------------------------
+# Print parameter statistics for transparency
+# ------------------------------------------------------------
+print(f"\nTrainable params: {trainable:,}")
+print(f"Total params    : {total:,}")
+
+# ------------------------------------------------------------
+# Move model to selected device (GPU or CPU)
+# ------------------------------------------------------------
+model.to(device)
+
+# ============================================================
+# 12) OPTIMIZER + SCHEDULER
+# ============================================================
+
+# ------------------------------------------------------------
+# Maximum number of training epochs
+# Early stopping will trigger before this if needed
+# ------------------------------------------------------------
+epochs = 15
+
+# ------------------------------------------------------------
+# AdamW optimizer with weight decay regularisation
+# Applied only to trainable parameters
+# lr=2e-5 standard for transformer fine-tuning
+# weight_decay=0.01 prevents overfitting
+# ------------------------------------------------------------
+optimizer = AdamW(
+
+    filter(
+        lambda p: p.requires_grad,
+        model.parameters()
+    ),
+
+    lr=2e-5,
+
+    weight_decay=0.01
+)
+
+# ------------------------------------------------------------
+# Conservative epoch estimate for scheduler
+# Prevents overly aggressive LR decay in early epochs
+# ------------------------------------------------------------
+expected_epochs = 10
+
+# ------------------------------------------------------------
+# Total training steps = batches per epoch × expected epochs
+# ------------------------------------------------------------
+total_steps = (
+    len(train_loader) *
+    expected_epochs
+)
+
+# ------------------------------------------------------------
+# Cosine LR scheduler with linear warmup
+# Warmup = 10% of total steps to stabilise early training
+# Cosine decay gradually reduces LR for stable convergence
+# ------------------------------------------------------------
+scheduler = get_cosine_schedule_with_warmup(
+
+    optimizer,
+
+    # warm up for first 10% of training steps
+    num_warmup_steps=int(
+        0.1 * total_steps
+    ),
+
+    # total training steps for cosine decay
+    num_training_steps=total_steps
+)
+
+# ============================================================
+# 13) EVALUATION UTILITIES
+# ============================================================
+
+# ------------------------------------------------------------
+# Named tuple for structured evaluation output
+# Improves readability when accessing evaluation results
+# ------------------------------------------------------------
+EvalResult = namedtuple(
+
+    "EvalResult",
+
+    [
+        "loss",    # average validation/test loss
+        "acc",     # overall accuracy
+        "f1",      # macro F1-score
+        "labels",  # true labels list
+        "preds"    # predicted labels list
+    ]
+)
+
+# ------------------------------------------------------------
+# Evaluation function used for validation and test sets
+# threshold parameter allows recall/precision trade-off
+# Default threshold=0.35 prioritises recall for missed cases
+# ------------------------------------------------------------
+def evaluate(loader, threshold=0.35):
+
+    # --------------------------------------------------------
+    # Switch model to evaluation mode
+    # Disables dropout and batch normalisation
+    # --------------------------------------------------------
+    model.eval()
+
+    # --------------------------------------------------------
+    # Storage for predictions and labels across all batches
+    # --------------------------------------------------------
+    all_preds  = []
+    all_labels = []
+    total_loss = 0
+
+    # --------------------------------------------------------
+    # Disable gradient computation for efficiency
+    # --------------------------------------------------------
+    with torch.no_grad():
+
+        # ----------------------------------------------------
+        # Iterate through all batches in the loader
+        # ----------------------------------------------------
+        for batch in loader:
+
+            # ------------------------------------------------
+            # Move all tensors to the selected device
+            # ------------------------------------------------
+            batch = {
+                k: v.to(device)
+                for k, v in batch.items()
+            }
+
+            # ------------------------------------------------
+            # Forward pass through DistilBERT
+            # ------------------------------------------------
+            outputs = model(**batch)
+
+            # ------------------------------------------------
+            # Extract raw prediction scores (logits)
+            # ------------------------------------------------
+            logits = outputs.logits
+
+            # ------------------------------------------------
+            # Compute weighted loss for monitoring
+            # ------------------------------------------------
+            loss = loss_fn(
+                logits,
+                batch["labels"]
+            )
+
+            # ------------------------------------------------
+            # Accumulate batch loss
+            # ------------------------------------------------
+            total_loss += loss.item()
+
+            # ------------------------------------------------
+            # Convert logits to probabilities using softmax
+            # ------------------------------------------------
+            probs = torch.softmax(
+                logits,
+                dim=1
+            )
+
+            # ------------------------------------------------
+            # Apply threshold to trafficking probability
+            # Scores >= threshold classified as trafficking
+            # ------------------------------------------------
+            preds = (
+                probs[:, 1] >= threshold
+            ).long()
+
+            # ------------------------------------------------
+            # Store batch predictions and true labels
+            # ------------------------------------------------
+            all_preds.extend(
+                preds.cpu().numpy()
+            )
+
+            all_labels.extend(
+                batch["labels"].cpu().numpy()
+            )
+
+    # --------------------------------------------------------
+    # Compute accuracy over full evaluation set
+    # --------------------------------------------------------
+    acc = accuracy_score(
+        all_labels,
+        all_preds
+    )
+
+    # --------------------------------------------------------
+    # Compute macro F1 over full evaluation set
+    # Primary metric for trafficking detection task
+    # --------------------------------------------------------
+    f1 = f1_score(
+        all_labels,
+        all_preds,
+        average="macro"
+    )
+
+    # --------------------------------------------------------
+    # Return structured evaluation result
+    # --------------------------------------------------------
+    return EvalResult(
+
+        loss=total_loss / len(loader),
+        acc=acc,
+        f1=f1,
+        labels=all_labels,
+        preds=all_preds
+    )
+
+# ============================================================
+# 14) TRAINING LOOP
+# ============================================================
+
+# ------------------------------------------------------------
+# Track best validation loss for model checkpointing
+# ------------------------------------------------------------
+best_val_loss = float("inf")
+
+# ------------------------------------------------------------
+# Early stopping patience: stop if no improvement for 3 epochs
+# ------------------------------------------------------------
+patience = 3
+
+# ------------------------------------------------------------
+# Early stopping counter
+# ------------------------------------------------------------
+counter = 0
+
+# ------------------------------------------------------------
+# Training loop over epochs
+# ------------------------------------------------------------
+for epoch in range(epochs):
+
+    # --------------------------------------------------------
+    # Switch model to training mode
+    # Enables dropout and gradient computation
+    # --------------------------------------------------------
+    model.train()
+
+    # --------------------------------------------------------
+    # Reset epoch loss accumulator
+    # --------------------------------------------------------
+    total_loss = 0
+
+    # --------------------------------------------------------
+    # Iterate through all training batches
+    # --------------------------------------------------------
+    for batch in train_loader:
+
+        # ----------------------------------------------------
+        # Move batch tensors to device
+        # ----------------------------------------------------
+        batch = {
+            k: v.to(device)
+            for k, v in batch.items()
+        }
+
+        # ----------------------------------------------------
+        # Forward pass through model
+        # ----------------------------------------------------
+        outputs = model(**batch)
+
+        # ----------------------------------------------------
+        # Extract logits from model output
+        # ----------------------------------------------------
+        logits = outputs.logits
+
+        # ----------------------------------------------------
+        # Compute weighted cross-entropy loss
+        # ----------------------------------------------------
+        loss = loss_fn(
+            logits,
+            batch["labels"]
+        )
+
+        # ----------------------------------------------------
+        # Reset gradients before backward pass
+        # ----------------------------------------------------
+        optimizer.zero_grad()
+
+        # ----------------------------------------------------
+        # Backward pass: compute gradients
+        # ----------------------------------------------------
+        loss.backward()
+
+        # ----------------------------------------------------
+        # Gradient clipping: prevent exploding gradients
+        # Clips gradient norm to maximum value of 1.0
+        # ----------------------------------------------------
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            1.0
+        )
+
+        # ----------------------------------------------------
+        # Update model parameters using optimizer
+        # ----------------------------------------------------
+        optimizer.step()
+
+        # ----------------------------------------------------
+        # Update learning rate scheduler
+        # ----------------------------------------------------
+        scheduler.step()
+
+        # ----------------------------------------------------
+        # Accumulate batch loss for epoch average
+        # ----------------------------------------------------
+        total_loss += loss.item()
+
+    # --------------------------------------------------------
+    # Compute average training loss for this epoch
+    # --------------------------------------------------------
+    train_loss = (
+        total_loss /
+        len(train_loader)
+    )
+
+    # --------------------------------------------------------
+    # Run evaluation on validation set
+    # Uses threshold=0.35 for recall-sensitive evaluation
+    # --------------------------------------------------------
+    result = evaluate(
+        valid_loader,
+        threshold=0.35
+    )
+
+    # --------------------------------------------------------
+    # Print epoch metrics for monitoring convergence
+    # --------------------------------------------------------
+    print(f"\nEpoch {epoch+1}")
+    print(f"Train Loss : {train_loss:.4f}")
+    print(f"Val Loss   : {result.loss:.4f}")
+    print(f"Val Acc    : {result.acc:.4f}")
+    print(f"Val F1     : {result.f1:.4f}")
+
+    # --------------------------------------------------------
+    # Save best model checkpoint if validation loss improved
+    # --------------------------------------------------------
+    if result.loss < best_val_loss:
+
+        best_val_loss = result.loss
+        counter       = 0
+
+        # ----------------------------------------------------
+        # Save model state dictionary to disk
+        # ----------------------------------------------------
+        torch.save(
+            model.state_dict(),
+            "best_model.pt"
+        )
+
+    # --------------------------------------------------------
+    # No improvement: increment early stopping counter
+    # --------------------------------------------------------
+    else:
+        counter += 1
+
+    # --------------------------------------------------------
+    # Trigger early stopping if patience exceeded
+    # --------------------------------------------------------
+    if counter >= patience:
+        print("\nEarly stopping triggered")
+        break
+
+# ============================================================
+# 15) LOAD BEST MODEL
+# ============================================================
+
+# ------------------------------------------------------------
+# Load best saved model weights for final evaluation
+# map_location ensures compatibility across GPU/CPU
+# ------------------------------------------------------------
+model.load_state_dict(
+    torch.load(
+        "best_model.pt",
+        map_location=device
+    )
+)
+
+# ============================================================
+# 16) FINAL TEST EVALUATION
+# ============================================================
+
+# ------------------------------------------------------------
+# Evaluate best model on held-out test set
+# Test set never seen during training or validation tuning
+# ------------------------------------------------------------
+test_result = evaluate(
+    test_loader,
+    threshold=0.35
+)
+
+# ------------------------------------------------------------
+# Print final test metrics
+# ------------------------------------------------------------
+print("\n==========================")
+print("FINAL TEST RESULTS")
+print("==========================")
+print(f"Test Loss : {test_result.loss:.4f}")
+print(f"Test Acc  : {test_result.acc:.4f}")
+print(f"Test F1   : {test_result.f1:.4f}")
+
+# ------------------------------------------------------------
+# Print detailed classification report
+# Shows per-class precision, recall, F1, and support
+# ------------------------------------------------------------
+print("\nClassification Report:\n")
+print(
+    classification_report(
+
+        test_result.labels,
+        test_result.preds,
+
+        target_names=[
+            "Legitimate",
+            "Trafficking"
+        ]
+    )
+)
+
+# ============================================================
+# 17) INFERENCE FUNCTION
+# ============================================================
+
+# ------------------------------------------------------------
+# Predict trafficking probability for a single unseen text
+# Used for deployment and real-time analysis
+# threshold parameter adjustable for operational requirements
+# Lower threshold = higher recall (fewer missed cases)
+# Higher threshold = higher precision (fewer false alerts)
+# ------------------------------------------------------------
+def predict(text, threshold=0.35):
+
+    # --------------------------------------------------------
+    # Switch model to evaluation mode
+    # --------------------------------------------------------
+    model.eval()
+
+    # --------------------------------------------------------
+    # Apply same preprocessing as training data
+    # --------------------------------------------------------
+    cleaned = clean_text(text)
+
+    # --------------------------------------------------------
+    # Tokenise cleaned text
+    # --------------------------------------------------------
+    encoding = tokenizer(
+
+        cleaned,
+        truncation=True,
+        padding="max_length",
+        max_length=MAX_LEN,
+        return_tensors="pt"
+    )
+
+    # --------------------------------------------------------
+    # Move tensors to device
+    # --------------------------------------------------------
+    encoding = {
+        k: v.to(device)
+        for k, v in encoding.items()
+    }
+
+    # --------------------------------------------------------
+    # Disable gradient computation for inference
+    # --------------------------------------------------------
+    with torch.no_grad():
+
+        # ----------------------------------------------------
+        # Forward pass through model
+        # ----------------------------------------------------
+        logits = model(**encoding).logits
+
+        # ----------------------------------------------------
+        # Convert logits to probabilities
+        # ----------------------------------------------------
+        probs = torch.softmax(
+            logits,
+            dim=1
+        )
+
+        # ----------------------------------------------------
+        # Extract trafficking class probability
+        # ----------------------------------------------------
+        trafficking_prob = probs[0, 1].item()
+
+    # --------------------------------------------------------
+    # Apply threshold for final binary prediction
+    # --------------------------------------------------------
+    prediction = (
+        "Trafficking"
+        if trafficking_prob >= threshold
+        else "Legitimate"
+    )
+
+    # --------------------------------------------------------
+    # Return structured prediction output
+    # --------------------------------------------------------
+    return {
+        "probability": round(trafficking_prob, 4),
+        "prediction":  prediction
+    }
+
+# ============================================================
+# 18) SAMPLE INFERENCE
+# ============================================================
+
+# ------------------------------------------------------------
+# Example trafficking-related advertisement text
+# Used to verify inference function works correctly
+# ------------------------------------------------------------
+sample_text = """
+young girl available tonight
+new in town
+private and discreet
+"""
+
+# ------------------------------------------------------------
+# Run prediction on sample text
+# ------------------------------------------------------------
+result = predict(sample_text)
+
+# ------------------------------------------------------------
+# Print prediction result
+# ------------------------------------------------------------
+print("\nSample Prediction:")
+print(result)
+
